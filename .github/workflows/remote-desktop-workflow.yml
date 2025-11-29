@@ -1,54 +1,149 @@
-name: Remote Desktop Parsec Session
+name: RDP + Tailscale + Parsec (Workflow 1)
 
-# This workflow must be triggered manually since it opens an interactive session.
 on:
   workflow_dispatch:
     inputs:
-      session_duration:
-        description: 'Maximum time (in minutes) to keep the session alive (e.g., 360 for 6 hours).'
-        required: true
-        default: '60' # Default session duration is 1 hour
+      ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
+      ts_api_key:        { description: "Tailscale API key (device admin, no Bearer)", required: true }
+      ts_authkey:        { description: "Tailscale Auth key", required: true }
+      quick_test:        { description: "Run 5-minute test", type: boolean, default: false }
+      runtime_minutes:   { description: "Runtime minutes", required: false, default: "355" }
+      do_purge:          { description: "Purge bullet* devices", required: false, default: "true" }
+      rdp_count:         { description: "RDP instance count (1-10)", required: false, default: "1" }
+      cycles_left:       { description: "Number of full cycles remaining", required: false, default: "5" }
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  # RDP Credentials (Default for the temporary account)
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  # Parsec Credentials (MUST be set as GitHub Secrets)
+  PARSEC_USER: ${{ secrets.PARSEC_USERNAME }}
+  PARSEC_PASS: ${{ secrets.PARSEC_PASSWORD }}
 
 jobs:
-  start_parsec_session:
-    # -------------------------------------------------------------------------
-    # IMPORTANT: You MUST use a self-hosted runner that is running Windows 
-    # and has the Parsec host application installed and configured.
-    # Replace 'windows' and 'gaming' with your runner's specific labels.
-    # -------------------------------------------------------------------------
-    runs-on: [self-hosted, windows, gaming]
-    
-    # Set a job-level timeout to prevent the job from running indefinitely. 
-    # The job will automatically cancel when this timeout is reached.
-    timeout-minutes: ${{ github.event.inputs.session_duration }}
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        run: |
+          $n=[int]"${{ inputs.rdp_count }}"
+          if($n -lt 1){$n=1}; if($n -gt 10){$n=10}
+          $arr=@(); for($i=1;$i -le $n;$i++){ $arr+=@{id=$i} }
+          $json=@{include=$arr}|ConvertTo-Json -Compress
+          "matrix=$json"|Out-File $env:GITHUB_OUTPUT -Append
+
+---
+
+  vps:
+    needs: setup
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    timeout-minutes: 370
 
     steps:
-      - name: Print Runner Information
+      - name: ⏱️ Decide Runtime
         run: |
-          Write-Host "--- Parsec Session Initialized ---"
-          Write-Host "Runner Name: ${{ runner.name }}"
-          Write-Host "Session will run for a maximum of ${{ github.event.inputs.session_duration }} minutes."
-          Write-Host "Connect to this machine now using your Parsec Client."
-          Write-Host "The workflow will automatically cancel when the time limit is reached."
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          $rt=if(Yes("${{ inputs.quick_test }}")){5}else{[int]"${{ inputs.runtime_minutes }}"}
+          if($rt -gt 360){$rt=355}
+          "RUNTIME_MINUTES=$rt"|Out-File -Append $env:GITHUB_ENV
+          Write-Host "Runtime set to $rt minutes"
 
-      # -------------------------------------------------------------------------
-      # This is the critical step. It keeps the GitHub Actions job alive 
-      # while you are connected via Parsec by forcing the job to wait.
-      # You need to manually cancel the job in the GitHub Actions UI 
-      # once you are finished, or wait for the timeout.
-      # -------------------------------------------------------------------------
-      - name: Wait for Manual Cancellation (or Timeout)
-        shell: powershell
-        # Convert the input duration to seconds for the sleep command
+      - name: 🌐 Install + Configure Tailscale
         run: |
-          $sleepSeconds = [int]($env:SESSION_DURATION * 60)
-          Write-Host "Sleeping for $sleepSeconds seconds to keep the session alive..."
-          Start-Sleep -Seconds $sleepSeconds
-        env:
-          SESSION_DURATION: ${{ github.event.inputs.session_duration }}
+          # Use the official Tailscale GitHub Action for a cleaner setup and guaranteed logout (v4+)
+          - name: Tailscale Connect
+            uses: tailscale/github-action@v4
+            with:
+              authkey: ${{ inputs.ts_authkey }}
+              hostname: "bullet-${{ matrix.id }}"
+              version: latest
+              # wait for connectivity to ensure the runner is ready
+              ping: "100.64.0.0" 
 
-      - name: Session Ended
-        run: Write-Host "The remote session has concluded."
-        # This final step ensures a message is logged regardless of whether it timed out 
-        # or was manually cancelled (which will stop the 'Wait' step and move to this).
+          # Retrieve Tailscale IP using the local tailscale CLI
+          $ts="$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ip=& $ts ip -4 |Select-Object -First 1
+          "TAILSCALE_IP=$ip"|Out-File -Append $env:GITHUB_ENV
+          Write-Host "Tailscale IPv4: $ip"
+
+      - name: 👤 Enable RDP User & Admin Account
+        run: |
+          # This account is necessary for Parsec to run in a user context
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $s=ConvertTo-SecureString $p -AsPlainText -Force
+          if(-not(Get-LocalUser -Name $u -EA SilentlyContinue)){
+            New-LocalUser -Name $u -Password $s -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          }
+          # Enable RDP for initial access/troubleshooting
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "RDP ready: $u / $p @ $env:TAILSCALE_IP"
+
+      - name: 🚀 Install & Configure Parsec
+        run: |
+          # 1. Download and run the Parsec installer silently (Per Computer install)
+          $url="https://builds.parsec.app/package/parsec-windows.exe"
+          $dst="$env:TEMP\parsec.exe"
+          Invoke-WebRequest $url -OutFile $dst
+          # Install Per-Computer (shared) and include the Virtual Display Driver (VDD)
+          Start-Process $dst -ArgumentList '/s', 'shared', 'vdd' -Wait
+          
+          # 2. Add 'Fallback to Virtual Display' setting to prevent black screen on disconnect
+          $RegPath = "HKLM:\SOFTWARE\Policies\Parsec"
+          if (-not (Test-Path $RegPath)) { New-Item -Path $RegPath | Out-Null }
+          Set-ItemProperty -Path $RegPath -Name "fallback_to_virtual" -Value 1 -Type DWORD
+
+      - name: 🔒 Log into Parsec Host (Unattended)
+        run: |
+          # The Windows Parsec app uses a command-line tool for unattended login.
+          $ParsecExe = "$env:ProgramFiles\Parsec\parsecd.exe"
+          
+          # Log in using the secured secrets
+          & $ParsecExe --log-on "$env:PARSEC_USER" "$env:PARSEC_PASS"
+          
+          Write-Host "🎉 Parsec is running and logged in. Check your Parsec client for a new host!"
+
+      - name: ❤️ Keep alive
+        run: |
+          $end=(Get-Date).AddMinutes([int]"${{ env.RUNTIME_MINUTES }}")
+          while((Get-Date) -lt $end){Write-Host ("Workflow1 heartbeat "+(Get-Date));Start-Sleep 60}
+
+      - name: Dispatch Workflow 2
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $next=[int]"${{ inputs.cycles_left }}"-1
+          if($next -gt 0){
+            $payload=@{
+              ts_tailnet="${{ inputs.ts_tailnet }}"
+              ts_api_key="${{ inputs.ts_api_key }}"
+              ts_authkey="${{ inputs.ts_authkey }}"
+              quick_test="${{ inputs.quick_test }}"
+              runtime_minutes="${{ inputs.runtime_minutes }}"
+              do_purge="${{ inputs.do_purge }}"
+              rdp_count="${{ inputs.rdp_count }}"
+              cycles_left="$next"
+            }
+            $url="https://api.github.com/repos/${{ github.repository }}/actions/workflows/workflow-2.yml/dispatches"
+            $hdr=@{Authorization="Bearer $env:GH_TOKEN";Accept="application/vnd.github+json"}
+            $body=@{ref="${{ github.ref_name }}";inputs=$payload}|ConvertTo-Json -Depth 20
+            Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body|Out-Null
+            Write-Host "➡️  Workflow 2 triggered. Cycles left: $next"
+          } else {
+            Write-Host "✅ Final cycle complete. No further workflows dispatched."
+          }
