@@ -1,0 +1,54 @@
+name: Remote Desktop Parsec Session
+
+# This workflow must be triggered manually since it opens an interactive session.
+on:
+  workflow_dispatch:
+    inputs:
+      session_duration:
+        description: 'Maximum time (in minutes) to keep the session alive (e.g., 360 for 6 hours).'
+        required: true
+        default: '60' # Default session duration is 1 hour
+
+jobs:
+  start_parsec_session:
+    # -------------------------------------------------------------------------
+    # IMPORTANT: You MUST use a self-hosted runner that is running Windows 
+    # and has the Parsec host application installed and configured.
+    # Replace 'windows' and 'gaming' with your runner's specific labels.
+    # -------------------------------------------------------------------------
+    runs-on: [self-hosted, windows, gaming]
+    
+    # Set a job-level timeout to prevent the job from running indefinitely. 
+    # The job will automatically cancel when this timeout is reached.
+    timeout-minutes: ${{ github.event.inputs.session_duration }}
+
+    steps:
+      - name: Print Runner Information
+        run: |
+          Write-Host "--- Parsec Session Initialized ---"
+          Write-Host "Runner Name: ${{ runner.name }}"
+          Write-Host "Session will run for a maximum of ${{ github.event.inputs.session_duration }} minutes."
+          Write-Host "Connect to this machine now using your Parsec Client."
+          Write-Host "The workflow will automatically cancel when the time limit is reached."
+
+      # -------------------------------------------------------------------------
+      # This is the critical step. It keeps the GitHub Actions job alive 
+      # while you are connected via Parsec by forcing the job to wait.
+      # You need to manually cancel the job in the GitHub Actions UI 
+      # once you are finished, or wait for the timeout.
+      # -------------------------------------------------------------------------
+      - name: Wait for Manual Cancellation (or Timeout)
+        shell: powershell
+        # Convert the input duration to seconds for the sleep command
+        run: |
+          $sleepSeconds = [int]($env:SESSION_DURATION * 60)
+          Write-Host "Sleeping for $sleepSeconds seconds to keep the session alive..."
+          Start-Sleep -Seconds $sleepSeconds
+        env:
+          SESSION_DURATION: ${{ github.event.inputs.session_duration }}
+
+      - name: Session Ended
+        run: Write-Host "The remote session has concluded."
+        # This final step ensures a message is logged regardless of whether it timed out 
+        # or was manually cancelled (which will stop the 'Wait' step and move to this).
+        if: always()
